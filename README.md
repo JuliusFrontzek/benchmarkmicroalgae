@@ -288,5 +288,11 @@ Licensing information is provided in the repository.
 
 ## Contact
 
-For questions, suggestions, or contributions, please open an issue or contact the repository maintainer.
- t
+For questions, suggestions, or contributions, please open an issue or contact the repository developers from the Automatic Control, Robotics and Mechatronics research group (https://arm.ual.es) at the University of Almeria (Spain):
+
+* Enrique Rodriguez Miranda (erm969@ual.es)
+* Pablo Otalora Berenguel (p.otalora@ual.es)
+* Jose Gonzalez Hernandez (j.gonzalez@ual.es)
+* Jose Luis Guzman Sanchez (joseluis.guzman@ual.es)
+
+---
