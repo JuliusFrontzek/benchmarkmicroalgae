@@ -76,3 +76,4 @@ fprintf('\nRunning multi-controller thermal-coupled simulation...\n');
 % fprintf('Successfully saved pH and Depth to simulation_results.csv\n');
 
 showResults
+save_result_plot_windows
