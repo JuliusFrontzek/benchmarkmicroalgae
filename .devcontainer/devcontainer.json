@@ -1,0 +1,39 @@
+{
+    "name": "MATLAB + Python (uv) + Claude",
+    "build": {
+        "dockerfile": "Dockerfile"
+    },
+    "remoteUser": "matlab",
+    "mounts": [
+        // Mount SSH keys for git access
+        "type=bind,source=${localEnv:HOME}/.ssh,target=/home/matlab/.ssh,readonly",
+        // Named volume for Claude session persistence
+        "source=claude-session-data,target=/home/matlab/.claude,type=volume"
+    ],
+    "customizations": {
+        "vscode": {
+            "settings": {
+                "python.defaultInterpreterPath": "/home/matlab/project/.venv/bin/python",
+                "terminal.integrated.defaultProfile.linux": "bash"
+            },
+            "extensions": [
+                "mathworks.language-matlab",
+                "ms-python.python",
+                "charliermarsh.ruff"
+            ]
+        }
+    },
+    "containerEnv": {
+        "MLM_LICENSE_FILE": "27004@lm-matlab.hrz.tu-chemnitz.de",
+        "LD_LIBRARY_PATH": "/opt/matlab/R2025b/bin/glnxa64:/usr/local/cuda/lib64",
+        "CC": "gcc",
+        "CXX": "g++",
+        "CUDA_HOME": "/usr/local/cuda",
+        "CUDA_VISIBLE_DEVICES": "0"
+    },
+    "runArgs": [
+        "--shm-size=512mb",
+        "--network=host",
+        "--gpus=device=2"
+    ]
+}
