@@ -1,38 +1,41 @@
 function [st_CtrlSignals, state] = controller_mpc_l4c(Timeline, obs, refs, env, future, st_CtrlSignals, state)
-% Initialize state if needed
-if isempty(state), state = struct(); end
-
-% 1. Prepare State Vector (nx=5)
-% Order: [pH, DO, Depth, Xalg, T]
-x_curr = [obs.pH, obs.DO, obs.Depth, obs.Xalg_gL, obs.T];
-
-% 2. Prepare Disturbance Vector (nd=7)
-% Map your env fields to the model's disturbance inputs
-d_curr = [env.Temp_ext, env.RadGlobal, env.RH, env.Wind, env.RadPAR, 0, 0];
-
-% 3. Prepare Reference Vector (3)
-r_curr = [refs.pH, refs.DO, refs.T];
-
-% 4. Call Python
-% We use pyrun to call the helper function in our py script
-try
-    u_python = pyrun("from mpc_handler import get_mpc_action; res = get_mpc_action(x, d, r)", ...
-        "res", x=x_curr, d=d_curr, r=r_curr);
-
-    % Convert python list to matlab double
-    u_opt = double(u_python);
-catch ME
-    fprintf('Error in Python MPC: %s\n', ME.message);
-    u_opt = zeros(1, 4); % Fallback
+% Initialize state for ZOH
+if isempty(state) || ~isfield(state, 'next_run_time')
+    state.next_run_time = -1;
+    state.last_u = [0, 0, 0, 0];
 end
 
-% 5. Map Outputs to st_CtrlSignals
-% Assumption: u_opt = [Qco2, Qair, Qd_bin, Qhx]
-st_CtrlSignals.Qco2 = max(0, u_opt(1));
-st_CtrlSignals.Qair = max(0, u_opt(2));
-st_CtrlSignals.Qd_bin = (u_opt(3) > 0.5); % Binary conversion if needed
-st_CtrlSignals.Qhx  = u_opt(4);
+time_step = 30 * 60;
 
-% Optional: set a default heating inlet temp if not part of MPC
-st_CtrlSignals.Tin_hx = 40.0;
+currentTime = Timeline.time;
+
+if currentTime >= state.next_run_time
+    % Prepare Vectors
+    x_curr = [obs.pH, obs.DO, obs.Depth, obs.Xalg_gL, obs.T];
+
+    % Keep d_curr as 7 elements as requested
+    d_curr = [env.RadGlobal, env.RadPAR, env.Temp_ext, env.RH, env.Wind, st_CtrlSignals.Qd_bin, st_CtrlSignals.Qh_bin];
+
+    r_curr = [refs.pH, refs.DO, refs.T];
+
+    % Call Python
+    try
+        u_python = pyrun("from mpc_handler import get_mpc_action; res = get_mpc_action(x, d, r)", ...
+            "res", x=x_curr, d=d_curr, r=r_curr);
+
+        state.last_u = double(u_python);
+        state.next_run_time = currentTime + time_step; % Schedule next run in 300s
+    catch ME
+        fprintf('Error in Python MPC at t=%.1f: %s\n', currentTime, ME.message);
+    end
+end
+
+% Apply Zero Order Hold
+u_opt = state.last_u;
+
+% Map to Control Signals
+st_CtrlSignals.Qco2   = max(0, u_opt(1));
+st_CtrlSignals.Qair   = max(0, u_opt(2));
+st_CtrlSignals.Qhx    = max(0, u_opt(3));
+st_CtrlSignals.Tin_hx = max(0, u_opt(4));
 end
