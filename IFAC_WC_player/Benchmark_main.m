@@ -1,6 +1,10 @@
 %% ===== Benchmark Microalgae Raceway Reactor (multi-controller, thermal-coupled) =====
 clear; clc; rng(42,'twister');
 close all
+
+% 1. FIX PATHS: Add parent and sibling folders
+addpath('..');           % For simulate_benchmark_model and plots
+addpath('../player');    % For controller_HD_fixed
 addpath('sources');
 
 %% ---------------- Data load ----------------
@@ -22,6 +26,7 @@ ctrl = struct();
 ctrl.fn_pH_CO2  = @controller_mpc_l4c;
 ctrl.fn_DO_air  = @controller_mpc_l4c;
 ctrl.fn_Temp_HX = @controller_mpc_l4c;
+ctrl.fn_HD      = @controller_HD_fixed;
 
 %% ---------------- Simulation ----------------
 % The simulation loop will now call the same MPC function for each sub-system.
@@ -76,4 +81,4 @@ fprintf('\nRunning multi-controller thermal-coupled simulation...\n');
 % fprintf('Successfully saved pH and Depth to simulation_results.csv\n');
 
 showResults
-save_result_plot_windows
+save_result_plot_windows(results);
