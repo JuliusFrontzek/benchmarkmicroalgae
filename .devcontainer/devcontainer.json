@@ -8,8 +8,14 @@
         // Mount SSH keys for git access
         "type=bind,source=${localEnv:HOME}/.ssh,target=/home/matlab/.ssh,readonly",
         // Named volume for Claude session persistence
-        "source=claude-session-data,target=/home/matlab/.claude,type=volume"
+        "source=claude-session-data,target=/home/matlab/.claude,type=volume",
+        "type=bind,source=${localEnv:HOME}/.claude,target=/home/matlab/.claude"
     ],
+    "features": {
+        "ghcr.io/anthropics/devcontainer-features/claude-code:1": {
+            "version": "latest"
+        }
+    },
     "customizations": {
         "vscode": {
             "settings": {
@@ -19,7 +25,8 @@
             "extensions": [
                 "mathworks.language-matlab",
                 "ms-python.python",
-                "charliermarsh.ruff"
+                "charliermarsh.ruff",
+                "anthropic.claude-code"
             ]
         }
     },
@@ -28,12 +35,12 @@
         "LD_LIBRARY_PATH": "/opt/matlab/R2025b/bin/glnxa64:/usr/local/cuda/lib64",
         "CC": "gcc",
         "CXX": "g++",
-        "CUDA_HOME": "/usr/local/cuda",
-        "CUDA_VISIBLE_DEVICES": "0"
+        "CUDA_HOME": "/usr/local/cuda"
     },
     "runArgs": [
         "--shm-size=512mb",
         "--network=host",
-        "--gpus=device=2"
-    ]
+        "--gpus=all"
+    ],
+    "postStartCommand": "python3 /workspaces/benchmarkmicroalgae/.devcontainer/select_free_gpu.py --set-bashrc"
 }

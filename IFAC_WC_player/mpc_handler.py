@@ -3,24 +3,144 @@ import torch.nn as nn
 import casadi as cs
 import l4casadi as l4c
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import os
+
+# Module-level state history buffer (filled by get_mpc_action each call)
+_state_history = []
+_MAX_HISTORY = 60
+
+# Cached raw PyTorch model for numpy rollouts (no CasADi dependency)
+_raw_nn_model = None
+
+
+def _load_raw_model(model_path="dynamic_model_l4casadi.pt"):
+    global _raw_nn_model
+    if _raw_nn_model is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        _raw_nn_model = torch.load(model_path, map_location=device, weights_only=False)
+        _raw_nn_model.eval()
+    return _raw_nn_model
+
+
+def _nn_rollout_numpy(nn_model, x0, u_seq, d_matrix):
+    """Open-loop N-step rollout using raw PyTorch (no CasADi).
+
+    Args:
+        nn_model: raw torch.nn.Module
+        x0: (5,) current state
+        u_seq: (4, N) control inputs per step
+        d_matrix: (7, N) disturbances per step
+
+    Returns:
+        X_pred: (5, N+1) state trajectory including x0
+    """
+    X_mean = np.array(X_MEAN)
+    X_std  = np.array(X_STD)
+    U_mean = np.array(U_MEAN)
+    U_std  = np.array(U_STD)
+    D_mean = np.array(D_MEAN)
+    D_std  = np.array(D_STD)
+
+    N = u_seq.shape[1]
+    X_pred = np.zeros((5, N + 1))
+    X_pred[:, 0] = x0.copy()
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    with torch.no_grad():
+        x = x0.copy().astype(np.float32)
+        for k in range(N):
+            x_scaled = (x - X_mean) / X_std
+            u_scaled = (u_seq[:, k] - U_mean) / U_std
+            d_scaled = (d_matrix[:, k] - D_mean) / D_std
+            inp = np.concatenate([x_scaled, u_scaled, d_scaled]).astype(np.float32)
+            inp_t = torch.tensor(inp).unsqueeze(0).to(device)
+            delta_scaled = nn_model(inp_t).cpu().numpy()[0]
+            delta_raw = delta_scaled * X_std
+            x = x + delta_raw
+            X_pred[:, k + 1] = x
+    return X_pred
+
+
+def plot_nn_predictions(x_history, x_curr, u_fixed, d_matrix,
+                        refs=None, save_path="nn_prediction_debug.png",
+                        model_path="dynamic_model_l4casadi.pt"):
+    """Diagnostic plot: past observed states + NN open-loop future predictions.
+
+    Args:
+        x_history: (T_hist, 5) past states, or [] / None if no history
+        x_curr: (5,) current state
+        u_fixed: (4,) control input held constant across all N prediction steps
+        d_matrix: (7, N) disturbance forecast
+        refs: optional [pH_ref, DO_ref, T_ref] for setpoint lines
+        save_path: where to save the figure
+        model_path: path to the NN weights file
+    """
+    x_history = np.array(x_history) if (x_history is not None and len(x_history) > 0) else np.empty((0, 5))
+    x_curr    = np.array(x_curr, dtype=float)
+    u_fixed   = np.array(u_fixed, dtype=float)
+    d_matrix  = np.array(d_matrix, dtype=float)
+    N = d_matrix.shape[1]
+
+    nn_model = _load_raw_model(model_path)
+    u_seq = np.tile(u_fixed[:, None], (1, N))
+    X_pred = _nn_rollout_numpy(nn_model, x_curr, u_seq, d_matrix)
+
+    dt = 5  # minutes per step
+    t_future = np.arange(0, (N + 1) * dt, dt)
+
+    has_hist = x_history.shape[0] > 0
+    if has_hist:
+        T_hist = x_history.shape[0]
+        t_hist = np.arange(-T_hist * dt, 0, dt)
+        # full past + current concatenated for a continuous line up to t=0
+        x_past_full = np.vstack([x_history, x_curr])
+        t_past_full  = np.append(t_hist, 0)
+    else:
+        t_past_full = np.array([0])
+        x_past_full = x_curr[None, :]
+
+    state_labels = ['pH', 'DO (%)', 'Depth (m)', 'Xalg (g/L)', 'Temperature (°C)']
+    sp_indices   = {0: refs[0] if refs else None,
+                    1: refs[1] if refs else None,
+                    4: refs[2] if refs else None}
+
+    fig, axes = plt.subplots(5, 1, figsize=(10, 14), sharex=True)
+    fig.suptitle('NN Model: Past Observations vs. Predicted Future Trajectory', fontsize=13)
+
+    for i, ax in enumerate(axes):
+        ax.plot(t_past_full, x_past_full[:, i], color='steelblue', lw=1.8, label='Observed')
+        ax.plot(t_future, X_pred[i, :], color='tomato', lw=1.8, linestyle='--', label='NN prediction')
+        ax.axvline(0, color='black', lw=0.8, linestyle=':')
+        sp = sp_indices.get(i)
+        if sp is not None:
+            ax.axhline(sp, color='grey', lw=1.2, linestyle=':', label=f'Setpoint ({sp})')
+        ax.set_ylabel(state_labels[i])
+        ax.legend(fontsize=7, loc='upper right')
+        ax.grid(True, alpha=0.3)
+
+    axes[-1].set_xlabel('Time relative to now (min)')
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=120)
+    plt.close(fig)
+    print(f"[NN Diagnostic] Prediction plot saved to: {os.path.abspath(save_path)}")
+    return os.path.abspath(save_path)
+
 
 def relative_absolute_error(ref, y, eps=1e-12):
-    """Sum of relative absolute tracking errors: sum(|ref - y| / (|ref| + eps))."""
-    # Use sum2 for horizontal row vectors
     return cs.sum2(cs.fabs(ref - y) / (cs.fabs(ref) + eps))
 
 def smoothness_cost(u, u_prev, u_min, u_max, eps=1e-12):
-    """Normalized squared input jumps: sum(((u_k - u_k-1) / range)^2)."""
     u_range = (u_max - u_min) + eps
-    # First step uses u_prev from the plant
     cost = ((u[0] - u_prev) / u_range)**2
-    # Subsequent steps in the horizon
     for i in range(1, u.shape[1]):
         cost += ((u[i] - u[i-1]) / u_range)**2
     return cost
 
 def consumption_cost(u, u_max, eps=1e-12):
-    """Normalized cumulative consumption: sum(u / u_max)."""
     return cs.sum2(u) / (u_max + eps)
 
 class L4CasADiWrapper(nn.Module):
@@ -34,7 +154,7 @@ class L4CasADiWrapper(nn.Module):
         return self.model(x)
 
 
-# Scaling Constants
+# Scaling Constants (derived from training data)
 X_MEAN = [7.9163324339067564, 120.71290085378622, 0.14845685279384763, 0.4793606812697203, 27.88878210112914]
 X_STD = [0.4744382035392219, 30.026734704243562, 0.004497946395715579, 0.05335923784587826, 3.8031253028626337]
 
@@ -44,73 +164,72 @@ U_STD = [0.0001233936408617958, 0.0029700696386538274, 0.00022966608129498743, 1
 D_MEAN = [267.46088324652777, 561.0259486975558, 26.01501011075797, 57.046535056498314, 2.214619182198748, 0.034915123456790126, 0.03125]
 D_STD = [306.6240325161852, 643.1745706067707, 4.447301442396769, 21.617538471642067, 1.6714980397152348, 0.18356485941099596, 0.17399263633843817]
 
-# --- MPC Class ---
+# Actuator physical limits
+U_LB = [0.0,          0.0,           0.0,          0.0]
+U_UB = [20/1000/60,   500/1000/60,   36/1000/60,   80.0]
+
+
+# --- Full MPC Class ---
 class MicroalgaeMPC:
     def __init__(self, model_path="dynamic_model_l4casadi.pt"):
-        # 1. Dimensions and Opti setup
-        self.N = 12; self.nx = 5; self.nu = 4; self.nd = 7
-        self.opti = cs.Opti()
+        self.N = 12
+        self.nx = 5
+        self.nu = 4
+        self.nd = 7
         
-        # Load L4CasADi Model
-        # The NN input is expected to be [nx + nu + nd] = 16 elements
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        nn_model = torch.load(
-            model_path, 
-            map_location=device, 
-            weights_only=False
-        )
+        self.opti = cs.Opti()
+        self._fail_count = 0
+
+        nn_model = torch.load(model_path, map_location='cpu', weights_only=False)
         self.l4c_model = l4c.L4CasADi(L4CasADiWrapper(nn_model))
 
-        # 2. Parameters
+        # Parameters
         self.p_u_prev = self.opti.parameter(self.nu)
         self.p_x0 = self.opti.parameter(self.nx)
-        # FIX: Disturbance is now a matrix (nd rows, N columns)
         self.p_dist = self.opti.parameter(self.nd, self.N)
-        self.p_refs = self.opti.parameter(3) # [pH, DO, Temp]
+        self.p_refs = self.opti.parameter(3)  # [pH, DO, Temp]
 
-        # 3. Decision Variables
+        # Decision Variables
         self.X = self.opti.variable(self.nx, self.N + 1)
         self.U = self.opti.variable(self.nu, self.N)
 
-        # 4. Dynamics Constraints (Crucial for utilizing p_dist trajectory)
+        # Input constraints (physical actuator limits)
+        for i in range(self.nu):
+            self.opti.subject_to(self.U[i, :] >= U_LB[i])
+            self.opti.subject_to(self.U[i, :] <= U_UB[i])
+
+        # Dynamics constraints
         self.opti.subject_to(self.X[:, 0] == self.p_x0)
         for k in range(self.N):
-            # 1. Scale inputs for the NN
             x_scaled = (self.X[:, k] - X_MEAN) / X_STD
             u_scaled = (self.U[:, k] - U_MEAN) / U_STD
             d_scaled = (self.p_dist[:, k] - D_MEAN) / D_STD
-            
-            # 2. Call NN to get Delta (Scaled)
             inputs = cs.vertcat(x_scaled, u_scaled, d_scaled)
             delta_scaled = self.l4c_model(inputs).T
-            
-            # 3. Unscale Delta: delta_raw = delta_scaled * sigma_x
             delta_raw = delta_scaled * X_STD
-            
-            # 4. Residual connection: x_next = x_curr + delta_raw
             self.opti.subject_to(self.X[:, k+1] == self.X[:, k] + delta_raw)
 
-        # 5. Normalization and Weights
+        # Cost weights and normalization
         norm = {
-            'CO2_max': 20/1000/60, 'CO2_min': 0.0,
-            'air_max': 200/1000/60, 'air_min': 0.0,
-            'Qw_max': 6e-4, 'Qw_min': 0.0,
-            'Tin_max': 80.0, 'Tin_min': 0.0
+            'CO2_max': U_UB[0], 'CO2_min': U_LB[0],
+            'air_max': U_UB[1], 'air_min': U_LB[1],
+            'Qw_max':  U_UB[2], 'Qw_min':  U_LB[2],
+            'Tin_max': U_UB[3], 'Tin_min': U_LB[3],
         }
         w = {
-            'pH': {'sp': 1196, 's': 2.6, 'c': 0.001},
-            'DO': {'sp': 34, 's': 0.1, 'c': 0.00001},
-            'T':  {'sp': 183, 's1': 3.0, 's2': 8.462, 'c': 0.0001}
+            'pH': {'sp': 1196, 's': 2.6,  'c': 0.001},
+            'DO': {'sp': 34,   's': 0.1,  'c': 0.00001},
+            'T':  {'sp': 183,  's1': 3.0, 's2': 8.462, 'c': 0.0001}
         }
 
-        # 6. Build Objective
+        # Objective
         jsp_pH = relative_absolute_error(self.p_refs[0], self.X[0, 1:])
         jsp_DO = relative_absolute_error(self.p_refs[1], self.X[1, 1:])
         jsp_T  = relative_absolute_error(self.p_refs[2], self.X[4, 1:])
 
-        js_pH = smoothness_cost(self.U[0, :], self.p_u_prev[0], norm['CO2_min'], norm['CO2_max'])
-        js_DO = smoothness_cost(self.U[1, :], self.p_u_prev[1], norm['air_min'], norm['air_max'])
-        js_qw_T = smoothness_cost(self.U[2, :], self.p_u_prev[2], norm['Qw_min'], norm['Qw_max'])
+        js_pH    = smoothness_cost(self.U[0, :], self.p_u_prev[0], norm['CO2_min'], norm['CO2_max'])
+        js_DO    = smoothness_cost(self.U[1, :], self.p_u_prev[1], norm['air_min'], norm['air_max'])
+        js_qw_T  = smoothness_cost(self.U[2, :], self.p_u_prev[2], norm['Qw_min'],  norm['Qw_max'])
         js_tin_T = smoothness_cost(self.U[3, :], self.p_u_prev[3], norm['Tin_min'], norm['Tin_max'])
 
         jc_pH = consumption_cost(self.U[0, :], norm['CO2_max'])
@@ -123,37 +242,280 @@ class MicroalgaeMPC:
             w['T']['sp']*jsp_T + w['T']['s1']*js_qw_T + w['T']['s2']*js_tin_T + w['T']['c']*jc_T
         )
 
-        # 7. Solver Setup
-        self.opti.solver('ipopt', {'ipopt': {'print_level': 0, 'max_iter': 50, 'tol': 1e-3}})
+        self.opti.solver('ipopt', {
+            'ipopt': {
+                'print_level': 0,
+                'max_iter': 500,
+                'tol': 1e-2,
+                'hessian_approximation': 'limited-memory',
+                'mu_strategy': 'adaptive',
+            }
+        })
 
     def solve(self, x_curr, d_matrix, refs, u_prev):
+        key = (tuple(np.round(x_curr, 6)), tuple(np.round(refs, 6)))
+        if hasattr(self, '_cache') and self._cache.get('key') == key:
+            return self._cache['result']
+
         self.opti.set_value(self.p_x0, x_curr)
         self.opti.set_value(self.p_dist, d_matrix)
         self.opti.set_value(self.p_refs, refs)
         self.opti.set_value(self.p_u_prev, u_prev)
 
-        # Warm start logic
         if hasattr(self, 'last_sol'):
-            self.opti.set_initial(self.U, self.last_sol.value(self.U))
-            self.opti.set_initial(self.X, self.last_sol.value(self.X))
-        
+            prev_U = self.last_sol.value(self.U)
+            prev_X = self.last_sol.value(self.X)
+            self.opti.set_initial(self.U, np.hstack([prev_U[:, 1:], prev_U[:, -1:]]))
+            self.opti.set_initial(self.X, np.hstack([prev_X[:, 1:], prev_X[:, -1:]]))
+
         try:
             sol = self.opti.solve()
             self.last_sol = sol
-            return sol.value(self.U[:, 0]).tolist()
-        except:
-            return self.opti.debug.value(self.U[:, 0]).tolist()
+            result = sol.value(self.U[:, 0]).tolist()
+            self._cache = {'key': key, 'result': result}
+            return result
+        except Exception as e:
+            self._fail_count += 1
+            print(f"[MPC] Solver failed (total failures: {self._fail_count}): {e}")
+            if hasattr(self, 'last_sol'):
+                return self.last_sol.value(self.U[:, 0]).tolist()
+            return list(u_prev)
+
+
+# --- Temperature-Only MPC (diagnostic) ---
+class TemperatureOnlyMPC:
+    """
+    Controls only Qhx (u[2]) and Tin_hx (u[3]) to track a temperature setpoint.
+    CO2 and air are treated as fixed zeros so the NN sees a consistent input.
+    Useful for verifying that the NN temperature model is working correctly.
+    """
+    def __init__(self, model_path="dynamic_model_l4casadi.pt"):
+        self.N = 12; self.nx = 5; self.nu = 4; self.nd = 7
+        self.opti = cs.Opti()
+        self._fail_count = 0
+
+        nn_model = torch.load(model_path, map_location='cpu', weights_only=False)
+        self.l4c_model = l4c.L4CasADi(L4CasADiWrapper(nn_model))
+
+        # Parameters
+        self.p_u_co2  = self.opti.parameter()        # fixed CO2 (from PI controller)
+        self.p_u_air  = self.opti.parameter()        # fixed air (from PI controller)
+        self.p_u_prev_qhx = self.opti.parameter()   # previous Qhx for smoothness
+        self.p_u_prev_tin = self.opti.parameter()   # previous Tin for smoothness
+        self.p_x0 = self.opti.parameter(self.nx)
+        self.p_dist = self.opti.parameter(self.nd, self.N)
+        self.p_T_ref = self.opti.parameter()  # temperature setpoint [°C]
+
+        # Decision Variables: only Qhx and Tin
+        self.Qhx = self.opti.variable(1, self.N)
+        self.Tin = self.opti.variable(1, self.N)
+        self.X = self.opti.variable(self.nx, self.N + 1)
+
+        # Input constraints
+        self.opti.subject_to(self.Qhx >= U_LB[2])
+        self.opti.subject_to(self.Qhx <= U_UB[2])
+        self.opti.subject_to(self.Tin >= U_LB[3])
+        self.opti.subject_to(self.Tin <= U_UB[3])
+
+        # Dynamics constraints — CO2 and air are fixed parameters, not optimised
+        self.opti.subject_to(self.X[:, 0] == self.p_x0)
+        for k in range(self.N):
+            # Assemble full input vector with fixed CO2/air
+            u_k = cs.vertcat(self.p_u_co2, self.p_u_air, self.Qhx[0, k], self.Tin[0, k])
+            x_scaled = (self.X[:, k] - X_MEAN) / X_STD
+            u_scaled = (u_k - U_MEAN) / U_STD
+            d_scaled = (self.p_dist[:, k] - D_MEAN) / D_STD
+            inputs = cs.vertcat(x_scaled, u_scaled, d_scaled)
+            delta_scaled = self.l4c_model(inputs).T
+            delta_raw = delta_scaled * X_STD
+            self.opti.subject_to(self.X[:, k+1] == self.X[:, k] + delta_raw)
+
+        # Objective: temperature tracking + smoothness
+        w_sp = 500.0   # setpoint tracking weight
+        w_s1 = 3.0     # Qhx smoothness
+        w_s2 = 8.462   # Tin smoothness
+
+        jsp_T = cs.sum2(cs.fabs(self.p_T_ref - self.X[4, 1:]))
+
+        qhx_range = U_UB[2] - U_LB[2]
+        tin_range = U_UB[3] - U_LB[3]
+        js_qhx = ((self.Qhx[0, 0] - self.p_u_prev_qhx) / qhx_range)**2
+        js_tin = ((self.Tin[0, 0] - self.p_u_prev_tin) / tin_range)**2
+        for i in range(1, self.N):
+            js_qhx += ((self.Qhx[0, i] - self.Qhx[0, i-1]) / qhx_range)**2
+            js_tin  += ((self.Tin[0, i] - self.Tin[0, i-1])  / tin_range)**2
+
+        self.opti.minimize(w_sp * jsp_T + w_s1 * js_qhx + w_s2 * js_tin)
+
+        self.opti.solver('ipopt', {
+            'ipopt': {
+                'print_level': 0,
+                'max_iter': 500,
+                'tol': 1e-2,
+                'hessian_approximation': 'limited-memory',
+                'mu_strategy': 'adaptive',
+            }
+        })
+
+    def solve(self, x_curr, d_matrix, T_ref, u_co2, u_air, u_prev_qhx, u_prev_tin):
+        self.opti.set_value(self.p_x0, x_curr)
+        self.opti.set_value(self.p_dist, d_matrix)
+        self.opti.set_value(self.p_T_ref, T_ref)
+        self.opti.set_value(self.p_u_co2, u_co2)
+        self.opti.set_value(self.p_u_air, u_air)
+        self.opti.set_value(self.p_u_prev_qhx, u_prev_qhx)
+        self.opti.set_value(self.p_u_prev_tin, u_prev_tin)
+
+        if hasattr(self, 'last_sol'):
+            prev_Qhx = self.last_sol.value(self.Qhx)
+            prev_Tin = self.last_sol.value(self.Tin)
+            prev_X = self.last_sol.value(self.X)
+            self.opti.set_initial(self.Qhx, np.hstack([prev_Qhx[:, 1:], prev_Qhx[:, -1:]]))
+            self.opti.set_initial(self.Tin,  np.hstack([prev_Tin[:, 1:],  prev_Tin[:, -1:]]))
+            self.opti.set_initial(self.X,    np.hstack([prev_X[:, 1:],    prev_X[:, -1:]]))
+
+        try:
+            sol = self.opti.solve()
+            self.last_sol = sol
+            return [sol.value(self.Qhx[0, 0]), sol.value(self.Tin[0, 0])]
+        except Exception as e:
+            self._fail_count += 1
+            print(f"[TempMPC] Solver failed (total failures: {self._fail_count}): {e}")
+            if hasattr(self, 'last_sol'):
+                return [self.last_sol.value(self.Qhx[0, 0]), self.last_sol.value(self.Tin[0, 0])]
+            return [u_prev_qhx, u_prev_tin]
+
+
+# --- Simplest Diagnostic MPC (1-step, 2 variables, quadratic cost) ---
+class SimpleTempMPC:
+    """
+    Minimal 1-step MPC for L4CasADi/IPOPT diagnostics.
+    Optimises Qhx and Tin_hx for pure quadratic temperature setpoint tracking.
+    No state trajectory, no equality constraints, no smoothness/consumption costs.
+    IPOPT output is verbose (print_level=5) to expose solver internals.
+    """
+    def __init__(self, model_path="dynamic_model_l4casadi.pt"):
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        # Raw model on best available device — used only for numpy forward-pass diagnostics
+        self._nn_model_raw = torch.load(model_path, map_location=device, weights_only=False)
+        self._nn_model_raw.eval()
+        # L4CasADi must run on CPU; load a separate CPU copy to avoid device conflicts
+        nn_model_cpu = torch.load(model_path, map_location='cpu', weights_only=False)
+        # Unique name forces fresh compilation separate from TemperatureOnlyMPC's cache
+        self.l4c_model = l4c.L4CasADi(L4CasADiWrapper(nn_model_cpu), name='simple_mpc')
+        self._fail_count = 0
+
+        opti = cs.Opti()
+        Qhx     = opti.variable()
+        Tin     = opti.variable()
+        p_x0    = opti.parameter(5)
+        p_d0    = opti.parameter(7)
+        p_T_ref = opti.parameter()
+
+        u_k   = cs.vertcat(0.0, 0.0, Qhx, Tin)
+        x_sc  = (p_x0 - cs.DM(X_MEAN)) / cs.DM(X_STD)
+        u_sc  = (u_k  - cs.DM(U_MEAN)) / cs.DM(U_STD)
+        d_sc  = (p_d0 - cs.DM(D_MEAN)) / cs.DM(D_STD)
+        nn_in = cs.vertcat(x_sc, u_sc, d_sc)
+        delta_sc_col = self.l4c_model(nn_in).T        # (5,1) after transpose
+        T_next = p_x0[4] + delta_sc_col[4] * X_STD[4]
+
+        opti.subject_to(opti.bounded(U_LB[2], Qhx, U_UB[2]))
+        opti.subject_to(opti.bounded(U_LB[3], Tin, U_UB[3]))
+        opti.minimize((p_T_ref - T_next)**2 + 1e-8*(Qhx**2 + Tin**2))
+
+        opti.solver('ipopt', {'ipopt': {
+            'print_level': 5,
+            'max_iter': 200,
+            'tol': 1e-4,
+            'hessian_approximation': 'limited-memory',
+        }})
+
+        self.opti = opti
+        self.Qhx = Qhx; self.Tin = Tin
+        self.p_x0 = p_x0; self.p_d0 = p_d0; self.p_T_ref = p_T_ref
+
+    def solve(self, x_curr, d_vec, T_ref):
+        # Numpy forward-pass check — confirms NN is healthy before IPOPT runs
+        u_test = np.array([0.0, 0.0, U_MEAN[2], T_ref], dtype=np.float32)
+        inp_np = np.concatenate([
+            (x_curr - np.array(X_MEAN)) / np.array(X_STD),
+            (u_test  - np.array(U_MEAN)) / np.array(U_STD),
+            (d_vec   - np.array(D_MEAN)) / np.array(D_STD),
+        ]).astype(np.float32)
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        with torch.no_grad():
+            delta_sc = self._nn_model_raw(
+                torch.tensor(inp_np).unsqueeze(0).to(device)
+            ).cpu().numpy()[0]
+        T_next_np = float(x_curr[4]) + delta_sc[4] * X_STD[4]
+        print(f"[SimpleTempMPC] NN check: T_curr={x_curr[4]:.3f}  "
+              f"T_next={T_next_np:.3f}  delta_T={delta_sc[4]*X_STD[4]:.4f}  "
+              f"any_nan={bool(np.any(np.isnan(delta_sc)))}")
+
+        self.opti.set_value(self.p_x0, x_curr)
+        self.opti.set_value(self.p_d0, d_vec)
+        self.opti.set_value(self.p_T_ref, T_ref)
+        self.opti.set_initial(self.Qhx, U_MEAN[2])
+        self.opti.set_initial(self.Tin, T_ref)
+        try:
+            sol = self.opti.solve()
+            return [float(sol.value(self.Qhx)), float(sol.value(self.Tin))]
+        except Exception as e:
+            self._fail_count += 1
+            print(f"[SimpleTempMPC] Solver failed ({self._fail_count}): {e}")
+            return [U_MEAN[2], float(T_ref)]
+
 
 # --- Singleton Logic ---
 _solver_instance = None
-_last_u = [0.0] * 4
+_temp_solver_instance = None
+_simple_temp_solver_instance = None
+
 
 def get_mpc_action(x, d_matrix, r, u_prev_ext):
-    global _solver_instance, _last_u
+    global _solver_instance, _state_history
+    x_np = np.array(x)
+    _state_history.append(x_np.copy())
+    if len(_state_history) > _MAX_HISTORY:
+        _state_history.pop(0)
     if _solver_instance is None:
         _solver_instance = MicroalgaeMPC()
-    
-    # We use the previous control signal to calculate smoothness cost
-    action = _solver_instance.solve(np.array(x), np.array(d_matrix), np.array(r), np.array(u_prev_ext))
-    _last_u = action 
-    return action
+    return _solver_instance.solve(x_np, np.array(d_matrix), np.array(r), np.array(u_prev_ext))
+
+
+def get_prediction_plot(x_curr, u_fixed, d_matrix, refs=None,
+                        save_path="nn_prediction_debug.png",
+                        model_path="dynamic_model_l4casadi.pt"):
+    """MATLAB-callable wrapper: plot NN predictions using the stored history buffer.
+
+    Call from MATLAB via:
+        pyrun("from mpc_handler import get_prediction_plot; p = get_prediction_plot(x, u, d, r)", ...
+              "p", x=x_curr, u=u_prev, d=d_future, r=r_curr)
+    """
+    hist = np.array(_state_history[:-1]) if len(_state_history) > 1 else np.empty((0, 5))
+    return plot_nn_predictions(
+        hist, np.array(x_curr), np.array(u_fixed), np.array(d_matrix),
+        refs=list(np.array(refs)) if refs is not None else None,
+        save_path=save_path, model_path=model_path
+    )
+
+
+def get_temp_mpc_action(x, d_matrix, T_ref, u_co2, u_air, u_prev_qhx, u_prev_tin):
+    global _temp_solver_instance
+    if _temp_solver_instance is None:
+        _temp_solver_instance = TemperatureOnlyMPC()
+    return _temp_solver_instance.solve(
+        np.array(x), np.array(d_matrix),
+        float(T_ref), float(u_co2), float(u_air),
+        float(u_prev_qhx), float(u_prev_tin)
+    )
+
+
+def get_simple_temp_mpc_action(x, d_vec, T_ref):
+    global _simple_temp_solver_instance
+    if _simple_temp_solver_instance is None:
+        _simple_temp_solver_instance = SimpleTempMPC()
+    return _simple_temp_solver_instance.solve(
+        np.array(x).ravel(), np.array(d_vec).ravel(), float(T_ref)
+    )

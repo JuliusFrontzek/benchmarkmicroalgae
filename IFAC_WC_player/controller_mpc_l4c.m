@@ -1,5 +1,10 @@
 function [st_CtrlSignals, state] = controller_mpc_l4c(Timeline, obs, refs, env, future, st_CtrlSignals, state)
-if isempty(state) || ~isfield(state, 'last_solve_time')
+
+    if exist('STOP.txt', 'file')
+        error('STOP.txt detected. Terminating simulation.');
+    end
+
+    if isempty(state) || ~isfield(state, 'last_solve_time')
     state.next_run_time = -1;
     state.last_solve_time = -1;
     state.last_u = [0, 0, 0, 0];
@@ -69,10 +74,10 @@ if (currentTime >= state.next_run_time) && (currentTime ~= state.last_solve_time
     end
 end
 
-% Apply signals
+% Apply signals with full actuator saturation
 u_opt = state.last_u;
-st_CtrlSignals.Qco2   = max(0, u_opt(1));
-st_CtrlSignals.Qair   = max(0, u_opt(2));
-st_CtrlSignals.Qhx    = max(0, u_opt(3));
-st_CtrlSignals.Tin_hx = max(0, u_opt(4));
+st_CtrlSignals.Qco2   = min(20/1000/60,  max(0, u_opt(1)));
+st_CtrlSignals.Qair   = min(500/1000/60, max(0, u_opt(2)));
+st_CtrlSignals.Qhx    = min(36/1000/60,  max(0, u_opt(3)));
+st_CtrlSignals.Tin_hx = min(80,          max(0, u_opt(4)));
 end
