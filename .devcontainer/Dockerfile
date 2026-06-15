@@ -46,6 +46,9 @@ WORKDIR /workspaces/benchmarkmicroalgae
 RUN curl -fsSL https://astral.sh/uv/install.sh | sh
 ENV PATH="/home/matlab/.local/bin:${PATH}"
 
+# Install Claude Code via the native installer (user-writable ~/.local, auto-updates cleanly)
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
 # 6. Create Python virtual environment in the workspace folder
 RUN uv venv .venv --python 3.12
 

@@ -168,6 +168,12 @@ D_STD = [306.6240325161852, 643.1745706067707, 4.447301442396769, 21.61753847164
 U_LB = [0.0,          0.0,           0.0,          0.0]
 U_UB = [20/1000/60,   500/1000/60,   36/1000/60,   80.0]
 
+# Constant heat-exchanger flux used by the temperature-only MPC. Fixing Qhx and
+# optimising only Tin removes the bilinear Qhx*(Tin-T) degeneracy. Max flow gives
+# the most heat-exchange authority and sits ~0.7 std above the training mean
+# (U_MEAN[2]=4.4e-4, U_STD[2]=2.3e-4), so it stays in-distribution for the NN.
+QHX_CONST = U_UB[2]
+
 
 # --- Full MPC Class ---
 class MicroalgaeMPC:
@@ -386,85 +392,105 @@ class TemperatureOnlyMPC:
             return [u_prev_qhx, u_prev_tin]
 
 
-# --- Simplest Diagnostic MPC (1-step, 2 variables, quadratic cost) ---
+# --- Simple Temp MPC (N=3, CasADi/L4CasADi, single-shooting) ---
 class SimpleTempMPC:
     """
-    Minimal 1-step MPC for L4CasADi/IPOPT diagnostics.
-    Optimises Qhx and Tin_hx for pure quadratic temperature setpoint tracking.
-    No state trajectory, no equality constraints, no smoothness/consumption costs.
-    IPOPT output is verbose (print_level=5) to expose solver internals.
+    3-step temperature MPC using CasADi/L4CasADi + IPOPT (single shooting).
+    Optimises only Tin[0:3] for a smooth (quadratic) temperature tracking cost
+    plus Tin smoothness. The heat-exchanger flux Qhx is held at QHX_CONST to
+    avoid the bilinear Qhx*(Tin-T) degeneracy. CO2 and air are fixed (not
+    optimised). IPOPT runs at print_level=5.
     """
     def __init__(self, model_path="dynamic_model_l4casadi.pt"):
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        # Raw model on best available device — used only for numpy forward-pass diagnostics
-        self._nn_model_raw = torch.load(model_path, map_location=device, weights_only=False)
-        self._nn_model_raw.eval()
-        # L4CasADi must run on CPU; load a separate CPU copy to avoid device conflicts
-        nn_model_cpu = torch.load(model_path, map_location='cpu', weights_only=False)
-        # Unique name forces fresh compilation separate from TemperatureOnlyMPC's cache
-        self.l4c_model = l4c.L4CasADi(L4CasADiWrapper(nn_model_cpu), name='simple_mpc')
+        self.N = 3
         self._fail_count = 0
 
+        nn_model_cpu = torch.load(model_path, map_location='cpu', weights_only=False)
+        self.l4c_model = l4c.L4CasADi(L4CasADiWrapper(nn_model_cpu), name='simple_mpc')
+
         opti = cs.Opti()
-        Qhx     = opti.variable()
-        Tin     = opti.variable()
-        p_x0    = opti.parameter(5)
-        p_d0    = opti.parameter(7)
-        p_T_ref = opti.parameter()
 
-        u_k   = cs.vertcat(0.0, 0.0, Qhx, Tin)
-        x_sc  = (p_x0 - cs.DM(X_MEAN)) / cs.DM(X_STD)
-        u_sc  = (u_k  - cs.DM(U_MEAN)) / cs.DM(U_STD)
-        d_sc  = (p_d0 - cs.DM(D_MEAN)) / cs.DM(D_STD)
-        nn_in = cs.vertcat(x_sc, u_sc, d_sc)
-        delta_sc_col = self.l4c_model(nn_in).T        # (5,1) after transpose
-        T_next = p_x0[4] + delta_sc_col[4] * X_STD[4]
+        # Decision variable: inlet-temperature trajectory only (Qhx fixed)
+        Tin = opti.variable(1, self.N)
 
-        opti.subject_to(opti.bounded(U_LB[2], Qhx, U_UB[2]))
-        opti.subject_to(opti.bounded(U_LB[3], Tin, U_UB[3]))
-        opti.minimize((p_T_ref - T_next)**2 + 1e-8*(Qhx**2 + Tin**2))
+        # Parameters
+        p_x0         = opti.parameter(5)
+        p_dist       = opti.parameter(7, self.N)
+        p_T_ref      = opti.parameter()
+        p_u_co2      = opti.parameter()
+        p_u_air      = opti.parameter()
+        p_u_prev_tin = opti.parameter()
+
+        # Box constraints
+        opti.subject_to(Tin >= U_LB[3])
+        opti.subject_to(Tin <= U_UB[3])
+
+        # Single-shooting: compose N NN calls symbolically (Qhx held constant)
+        x_k = p_x0
+        T_preds = []
+        for k in range(self.N):
+            u_k  = cs.vertcat(p_u_co2, p_u_air, QHX_CONST, Tin[0, k])
+            x_sc = (x_k          - cs.DM(X_MEAN)) / cs.DM(X_STD)
+            u_sc = (u_k          - cs.DM(U_MEAN)) / cs.DM(U_STD)
+            d_sc = (p_dist[:, k] - cs.DM(D_MEAN)) / cs.DM(D_STD)
+            delta_sc = self.l4c_model(cs.vertcat(x_sc, u_sc, d_sc)).T  # (5,1)
+            x_k = x_k + delta_sc * cs.DM(X_STD)
+            T_preds.append(x_k[4])
+
+        # Cost: smooth quadratic tracking over N steps + Tin smoothness
+        w_sp = 1.0; w_s = 0.5
+        tin_range = U_UB[3] - U_LB[3]
+        jsp_T = cs.sum1(cs.vertcat(*[(p_T_ref - T_k) ** 2 for T_k in T_preds]))
+        js_tin = ((Tin[0, 0] - p_u_prev_tin) / tin_range) ** 2
+        for i in range(1, self.N):
+            js_tin += ((Tin[0, i] - Tin[0, i-1]) / tin_range) ** 2
+        opti.minimize(w_sp * jsp_T + w_s * js_tin)
 
         opti.solver('ipopt', {'ipopt': {
             'print_level': 5,
             'max_iter': 200,
-            'tol': 1e-4,
+            'tol': 1e-2,
+            'acceptable_tol': 1e-1,
+            'acceptable_iter': 5,
             'hessian_approximation': 'limited-memory',
+            'mu_strategy': 'adaptive',
         }})
 
         self.opti = opti
-        self.Qhx = Qhx; self.Tin = Tin
-        self.p_x0 = p_x0; self.p_d0 = p_d0; self.p_T_ref = p_T_ref
+        self.Tin = Tin
+        self.p_x0 = p_x0; self.p_dist = p_dist; self.p_T_ref = p_T_ref
+        self.p_u_co2 = p_u_co2; self.p_u_air = p_u_air
+        self.p_u_prev_tin = p_u_prev_tin
 
-    def solve(self, x_curr, d_vec, T_ref):
-        # Numpy forward-pass check — confirms NN is healthy before IPOPT runs
-        u_test = np.array([0.0, 0.0, U_MEAN[2], T_ref], dtype=np.float32)
-        inp_np = np.concatenate([
-            (x_curr - np.array(X_MEAN)) / np.array(X_STD),
-            (u_test  - np.array(U_MEAN)) / np.array(U_STD),
-            (d_vec   - np.array(D_MEAN)) / np.array(D_STD),
-        ]).astype(np.float32)
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        with torch.no_grad():
-            delta_sc = self._nn_model_raw(
-                torch.tensor(inp_np).unsqueeze(0).to(device)
-            ).cpu().numpy()[0]
-        T_next_np = float(x_curr[4]) + delta_sc[4] * X_STD[4]
-        print(f"[SimpleTempMPC] NN check: T_curr={x_curr[4]:.3f}  "
-              f"T_next={T_next_np:.3f}  delta_T={delta_sc[4]*X_STD[4]:.4f}  "
-              f"any_nan={bool(np.any(np.isnan(delta_sc)))}")
+    def solve(self, x_curr, d_matrix, T_ref, u_co2=0.0, u_air=0.0,
+              u_prev_qhx=None, u_prev_tin=None):
+        # u_prev_qhx is accepted for call-signature compatibility but unused:
+        # the flux is fixed at QHX_CONST and only Tin is optimised.
+        if u_prev_tin is None: u_prev_tin = float(T_ref)
 
         self.opti.set_value(self.p_x0, x_curr)
-        self.opti.set_value(self.p_d0, d_vec)
+        self.opti.set_value(self.p_dist, d_matrix)
         self.opti.set_value(self.p_T_ref, T_ref)
-        self.opti.set_initial(self.Qhx, U_MEAN[2])
-        self.opti.set_initial(self.Tin, T_ref)
+        self.opti.set_value(self.p_u_co2, u_co2)
+        self.opti.set_value(self.p_u_air, u_air)
+        self.opti.set_value(self.p_u_prev_tin, u_prev_tin)
+
+        if hasattr(self, 'last_sol'):
+            prev_Tin = self.last_sol.value(self.Tin).reshape(1, self.N)
+            self.opti.set_initial(self.Tin, np.hstack([prev_Tin[:, 1:], prev_Tin[:, -1:]]))
+        else:
+            self.opti.set_initial(self.Tin, np.full((1, self.N), u_prev_tin))
+
         try:
             sol = self.opti.solve()
-            return [float(sol.value(self.Qhx)), float(sol.value(self.Tin))]
+            self.last_sol = sol
+            return [QHX_CONST, float(sol.value(self.Tin[0, 0]))]
         except Exception as e:
             self._fail_count += 1
             print(f"[SimpleTempMPC] Solver failed ({self._fail_count}): {e}")
-            return [U_MEAN[2], float(T_ref)]
+            if hasattr(self, 'last_sol'):
+                return [QHX_CONST, float(self.last_sol.value(self.Tin[0, 0]))]
+            return [QHX_CONST, float(T_ref)]
 
 
 # --- Singleton Logic ---
@@ -512,10 +538,11 @@ def get_temp_mpc_action(x, d_matrix, T_ref, u_co2, u_air, u_prev_qhx, u_prev_tin
     )
 
 
-def get_simple_temp_mpc_action(x, d_vec, T_ref):
+def get_simple_temp_mpc_action(x, d_matrix, T_ref, u_prev_qhx=0.0, u_prev_tin=30.0):
     global _simple_temp_solver_instance
     if _simple_temp_solver_instance is None:
         _simple_temp_solver_instance = SimpleTempMPC()
     return _simple_temp_solver_instance.solve(
-        np.array(x).ravel(), np.array(d_vec).ravel(), float(T_ref)
+        np.array(x).ravel(), np.array(d_matrix), float(T_ref),
+        u_prev_qhx=float(u_prev_qhx), u_prev_tin=float(u_prev_tin)
     )

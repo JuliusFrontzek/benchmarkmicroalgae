@@ -7,15 +7,9 @@
     "mounts": [
         // Mount SSH keys for git access
         "type=bind,source=${localEnv:HOME}/.ssh,target=/home/matlab/.ssh,readonly",
-        // Named volume for Claude session persistence
-        "source=claude-session-data,target=/home/matlab/.claude,type=volume",
+        // Bind the host's Claude config/session dir for persistence
         "type=bind,source=${localEnv:HOME}/.claude,target=/home/matlab/.claude"
     ],
-    "features": {
-        "ghcr.io/anthropics/devcontainer-features/claude-code:1": {
-            "version": "latest"
-        }
-    },
     "customizations": {
         "vscode": {
             "settings": {
