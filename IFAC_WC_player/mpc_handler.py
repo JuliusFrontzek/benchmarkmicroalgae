@@ -174,6 +174,17 @@ U_UB = [20/1000/60,   500/1000/60,   36/1000/60,   80.0]
 # (U_MEAN[2]=4.4e-4, U_STD[2]=2.3e-4), so it stays in-distribution for the NN.
 QHX_CONST = U_UB[2]
 
+# Prediction horizon for the simple temperature MPC, in 5-minute steps. Single
+# source of truth: the MATLAB controller fetches it (so the forecast matrix width
+# always matches) and SimpleTempMPC sizes its NLP from it. Change it here only.
+# N=6 -> 30 min lookahead.
+SIMPLE_TEMP_MPC_N = 6
+
+# Prediction horizon for the simple pH MPC, in 5-minute steps. Same single-
+# source-of-truth pattern as SIMPLE_TEMP_MPC_N: the MATLAB controller fetches it
+# so the forecast matrix width always matches the NLP. N=6 -> 30 min lookahead.
+SIMPLE_PH_MPC_N = 6
+
 
 # --- Full MPC Class ---
 class MicroalgaeMPC:
@@ -395,14 +406,17 @@ class TemperatureOnlyMPC:
 # --- Simple Temp MPC (N=3, CasADi/L4CasADi, single-shooting) ---
 class SimpleTempMPC:
     """
-    3-step temperature MPC using CasADi/L4CasADi + IPOPT (single shooting).
-    Optimises only Tin[0:3] for a smooth (quadratic) temperature tracking cost
+    N-step temperature MPC using CasADi/L4CasADi + IPOPT (single shooting).
+    The horizon N is set by the module constant SIMPLE_TEMP_MPC_N (5 min/step).
+    Optimises only Tin[0:N] for a smooth (quadratic) temperature tracking cost
     plus Tin smoothness. The heat-exchanger flux Qhx is held at QHX_CONST to
     avoid the bilinear Qhx*(Tin-T) degeneracy. CO2 and air are fixed (not
-    optimised). IPOPT runs at print_level=5.
+    optimised). The scheduled harvest/dilution disturbances (d rows 6,7) are
+    fed in by the caller so the controller can pre-heat before cold-water
+    injections.
     """
     def __init__(self, model_path="dynamic_model_l4casadi.pt"):
-        self.N = 3
+        self.N = SIMPLE_TEMP_MPC_N
         self._fail_count = 0
 
         nn_model_cpu = torch.load(model_path, map_location='cpu', weights_only=False)
@@ -447,7 +461,7 @@ class SimpleTempMPC:
         opti.minimize(w_sp * jsp_T + w_s * js_tin)
 
         opti.solver('ipopt', {'ipopt': {
-            'print_level': 5,
+            'print_level': 0,  # quiet; _fail_count print surfaces problems
             'max_iter': 200,
             'tol': 1e-2,
             'acceptable_tol': 1e-1,
@@ -493,10 +507,133 @@ class SimpleTempMPC:
             return [QHX_CONST, float(T_ref)]
 
 
+# --- Simple pH MPC (CasADi/L4CasADi, single-shooting) ---
+class SimplePHMPC:
+    """
+    N-step pH MPC using CasADi/L4CasADi + IPOPT (single shooting).
+    The horizon N is set by the module constant SIMPLE_PH_MPC_N (5 min/step).
+    Optimises only the CO2 injection CO2[0:N] to track the benchmark pH
+    setpoint. Air, heat-exchanger flux Qhx and inlet temperature Tin are held
+    fixed (defaults: training means, to keep the NN rollout in-distribution).
+
+    Cost: the control-action penalty (consumption) and control-action smoothness
+    follow the main MicroalgaeMPC cost (same smoothness_cost / consumption_cost
+    helpers and pH weights). Setpoint tracking uses a smooth quadratic (as in
+    SimpleTempMPC) rather than the main class's relative_absolute_error: the
+    abs() kink at the setpoint crossing makes the smooth IPOPT NLP thrash.
+    """
+    def __init__(self, model_path="dynamic_model_l4casadi.pt"):
+        self.N = SIMPLE_PH_MPC_N
+        self._fail_count = 0
+
+        nn_model_cpu = torch.load(model_path, map_location='cpu', weights_only=False)
+        self.l4c_model = l4c.L4CasADi(L4CasADiWrapper(nn_model_cpu), name='simple_ph_mpc')
+
+        opti = cs.Opti()
+
+        # Decision variable: CO2-injection trajectory only (Air/Qhx/Tin fixed).
+        # Optimised in NORMALISED units [0, 1] and mapped to physical CO2 via
+        # U_UB[0] (U_LB[0]=0). Physical CO2 is O(1e-4), which is badly scaled
+        # for IPOPT; the normalised variable keeps the NLP well-conditioned.
+        CO2n = opti.variable(1, self.N)
+        CO2  = CO2n * U_UB[0]   # 1xN physical CO2 row (m^3/s)
+
+        # Parameters
+        p_x0         = opti.parameter(5)
+        p_dist       = opti.parameter(7, self.N)
+        p_pH_ref     = opti.parameter()
+        p_u_air      = opti.parameter()
+        p_u_qhx      = opti.parameter()
+        p_u_tin      = opti.parameter()
+        p_u_prev_co2 = opti.parameter()
+
+        # Box constraints (normalised)
+        opti.subject_to(CO2n >= 0.0)
+        opti.subject_to(CO2n <= 1.0)
+
+        # Single-shooting: compose N NN calls symbolically (Air/Qhx/Tin held constant)
+        x_k = p_x0
+        pH_preds = []
+        for k in range(self.N):
+            u_k  = cs.vertcat(CO2[0, k], p_u_air, p_u_qhx, p_u_tin)
+            x_sc = (x_k          - cs.DM(X_MEAN)) / cs.DM(X_STD)
+            u_sc = (u_k          - cs.DM(U_MEAN)) / cs.DM(U_STD)
+            d_sc = (p_dist[:, k] - cs.DM(D_MEAN)) / cs.DM(D_STD)
+            delta_sc = self.l4c_model(cs.vertcat(x_sc, u_sc, d_sc)).T  # (5,1)
+            x_k = x_k + delta_sc * cs.DM(X_STD)
+            pH_preds.append(x_k[0])
+
+        # Cost: control smoothness + consumption follow the main MicroalgaeMPC
+        # cost (same helpers + pH weights); tracking is a smooth quadratic.
+        w = {'sp': 1196, 's': 2.6, 'c': 0.001}
+        pH_row = cs.horzcat(*pH_preds)                                  # 1xN, like X[0, 1:]
+        jsp = cs.sum2((p_pH_ref - pH_row) ** 2)                         # setpoint tracking
+        js  = smoothness_cost(CO2, p_u_prev_co2, U_LB[0], U_UB[0])      # control smoothness
+        jc  = consumption_cost(CO2, U_UB[0])                            # control magnitude
+        opti.minimize(w['sp'] * jsp + w['s'] * js + w['c'] * jc)
+
+        opti.solver('ipopt', {'ipopt': {
+            'print_level': 0,  # quiet; _fail_count print surfaces problems
+            'max_iter': 200,
+            'tol': 1e-2,
+            'acceptable_tol': 1e-1,
+            'acceptable_iter': 5,
+            'hessian_approximation': 'limited-memory',
+            'mu_strategy': 'adaptive',
+        }})
+
+        self.opti = opti
+        self.CO2n = CO2n; self.CO2 = CO2
+        self.p_x0 = p_x0; self.p_dist = p_dist; self.p_pH_ref = p_pH_ref
+        self.p_u_air = p_u_air; self.p_u_qhx = p_u_qhx; self.p_u_tin = p_u_tin
+        self.p_u_prev_co2 = p_u_prev_co2
+
+    def solve(self, x_curr, d_matrix, pH_ref, u_air=None, u_qhx=None,
+              u_tin=None, u_prev_co2=0.0):
+        # Non-optimised actuators: use the actually-applied values from the
+        # co-running DO/Temp controllers when supplied, so the pH prediction is
+        # not biased by assuming training-mean air/temperature. Missing values
+        # (None / NaN, e.g. before the other controllers have run) fall back to
+        # the training means to keep the NN rollout in-distribution.
+        def _val(v, default):
+            if v is None: return default
+            v = float(v)
+            return default if not np.isfinite(v) else v
+        u_air = _val(u_air, U_MEAN[1])
+        u_qhx = _val(u_qhx, U_MEAN[2])
+        u_tin = _val(u_tin, U_MEAN[3])
+
+        self.opti.set_value(self.p_x0, x_curr)
+        self.opti.set_value(self.p_dist, d_matrix)
+        self.opti.set_value(self.p_pH_ref, pH_ref)
+        self.opti.set_value(self.p_u_air, u_air)
+        self.opti.set_value(self.p_u_qhx, u_qhx)
+        self.opti.set_value(self.p_u_tin, u_tin)
+        self.opti.set_value(self.p_u_prev_co2, u_prev_co2)
+
+        if hasattr(self, 'last_sol'):
+            prev_CO2n = self.last_sol.value(self.CO2n).reshape(1, self.N)
+            self.opti.set_initial(self.CO2n, np.hstack([prev_CO2n[:, 1:], prev_CO2n[:, -1:]]))
+        else:
+            self.opti.set_initial(self.CO2n, np.full((1, self.N), u_prev_co2 / U_UB[0]))
+
+        try:
+            sol = self.opti.solve()
+            self.last_sol = sol
+            return [float(sol.value(self.CO2[0, 0]))]
+        except Exception as e:
+            self._fail_count += 1
+            print(f"[SimplePHMPC] Solver failed ({self._fail_count}): {e}")
+            if hasattr(self, 'last_sol'):
+                return [float(self.last_sol.value(self.CO2[0, 0]))]
+            return [0.0]
+
+
 # --- Singleton Logic ---
 _solver_instance = None
 _temp_solver_instance = None
 _simple_temp_solver_instance = None
+_simple_ph_solver_instance = None
 
 
 def get_mpc_action(x, d_matrix, r, u_prev_ext):
@@ -545,4 +682,15 @@ def get_simple_temp_mpc_action(x, d_matrix, T_ref, u_prev_qhx=0.0, u_prev_tin=30
     return _simple_temp_solver_instance.solve(
         np.array(x).ravel(), np.array(d_matrix), float(T_ref),
         u_prev_qhx=float(u_prev_qhx), u_prev_tin=float(u_prev_tin)
+    )
+
+
+def get_simple_ph_mpc_action(x, d_matrix, pH_ref, u_prev_co2=0.0,
+                             u_air=None, u_qhx=None, u_tin=None):
+    global _simple_ph_solver_instance
+    if _simple_ph_solver_instance is None:
+        _simple_ph_solver_instance = SimplePHMPC()
+    return _simple_ph_solver_instance.solve(
+        np.array(x).ravel(), np.array(d_matrix), float(pH_ref),
+        u_air=u_air, u_qhx=u_qhx, u_tin=u_tin, u_prev_co2=float(u_prev_co2)
     )
