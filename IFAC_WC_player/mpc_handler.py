@@ -185,6 +185,20 @@ SIMPLE_TEMP_MPC_N = 6
 # so the forecast matrix width always matches the NLP. N=6 -> 30 min lookahead.
 SIMPLE_PH_MPC_N = 6
 
+# Combined temperature + dissolved-oxygen MPC: horizon (5-min steps) and cost
+# weights, all in one place for easy tuning. Optimises Tin_hx (temperature) and
+# air injection (DO) together; Qhx fixed at QHX_CONST, CO2 fixed (param).
+SIMPLE_TEMPDO_MPC_N = 6
+# DO error is divided by DO_SCALE (~one std) before squaring so its tracking
+# term is the same order as the temperature term (raw degC^2).
+TEMPDO_DO_SCALE = 30.0
+TEMPDO_W = {
+    'T':     1.0,   # temperature setpoint tracking (raw degC^2)
+    'DO':    1.0,   # DO setpoint tracking (normalised by DO_SCALE)
+    's_tin': 0.5,   # Tin move smoothness
+    's_air': 2.0,   # air move smoothness (higher -> less DO actuation noise)
+}
+
 
 # --- Full MPC Class ---
 class MicroalgaeMPC:
@@ -629,11 +643,162 @@ class SimplePHMPC:
             return [0.0]
 
 
+# --- Combined Temperature + DO MPC (CasADi/L4CasADi, single-shooting) ---
+class SimpleTempDOMPC:
+    """
+    N-step MPC that controls BOTH raceway temperature and dissolved oxygen.
+    Decision variables: inlet temperature Tin (U[3]) and air injection (U[1]);
+    horizon N = SIMPLE_TEMPDO_MPC_N (5 min/step). The heat-exchanger flux Qhx is
+    held at QHX_CONST (as in SimpleTempMPC) and CO2 (U[0]) is a fixed parameter
+    taken from the co-running pH controller.
+
+    Cost: smooth quadratic tracking of the temperature setpoint (scalar) and the
+    dissolved-oxygen setpoint (per-step vector, so a day/night DO profile can be
+    tracked within the horizon) plus Tin and air move-smoothness. Air smoothness
+    is weighted relatively high to keep the DO actuation quiet (less noisy than
+    the PI baseline). The temperature half mirrors SimpleTempMPC exactly.
+    """
+    def __init__(self, model_path="dynamic_model_l4casadi.pt"):
+        self.N = SIMPLE_TEMPDO_MPC_N
+        self._fail_count = 0
+
+        nn_model_cpu = torch.load(model_path, map_location='cpu', weights_only=False)
+        self.l4c_model = l4c.L4CasADi(L4CasADiWrapper(nn_model_cpu), name='simple_tempdo_mpc')
+
+        opti = cs.Opti()
+
+        # Decision variables: Tin trajectory + normalised air trajectory. Air is
+        # optimised in [0, 1] and mapped to physical units via U_UB[1] (U_LB[1]=0)
+        # because physical air is O(1e-3) and badly scaled for IPOPT (same trick
+        # as SimplePHMPC's CO2).
+        Tin  = opti.variable(1, self.N)
+        Airn = opti.variable(1, self.N)
+        Air  = Airn * U_UB[1]
+
+        # Parameters
+        p_x0          = opti.parameter(5)
+        p_dist        = opti.parameter(7, self.N)
+        p_T_ref       = opti.parameter()           # scalar temperature setpoint
+        p_DO_ref      = opti.parameter(1, self.N)  # per-step DO setpoint (day/night)
+        p_u_co2       = opti.parameter()           # fixed CO2 from pH controller
+        p_u_prev_tin  = opti.parameter()
+        p_u_prev_airn = opti.parameter()           # previous air, normalised
+
+        # Box constraints
+        opti.subject_to(Tin >= U_LB[3])
+        opti.subject_to(Tin <= U_UB[3])
+        opti.subject_to(Airn >= 0.0)
+        opti.subject_to(Airn <= 1.0)
+
+        # Single-shooting: compose N NN calls symbolically (Qhx held constant,
+        # CO2 fixed parameter). Collect T and DO predictions for the cost.
+        x_k = p_x0
+        T_preds = []
+        DO_preds = []
+        for k in range(self.N):
+            u_k  = cs.vertcat(p_u_co2, Air[0, k], QHX_CONST, Tin[0, k])
+            x_sc = (x_k          - cs.DM(X_MEAN)) / cs.DM(X_STD)
+            u_sc = (u_k          - cs.DM(U_MEAN)) / cs.DM(U_STD)
+            d_sc = (p_dist[:, k] - cs.DM(D_MEAN)) / cs.DM(D_STD)
+            delta_sc = self.l4c_model(cs.vertcat(x_sc, u_sc, d_sc)).T  # (5,1)
+            x_k = x_k + delta_sc * cs.DM(X_STD)
+            DO_preds.append(x_k[1])
+            T_preds.append(x_k[4])
+
+        # Cost: temperature + DO tracking + Tin/air move smoothness
+        w = TEMPDO_W
+        tin_range = U_UB[3] - U_LB[3]
+
+        jsp_T  = cs.sum1(cs.vertcat(*[(p_T_ref - T_k) ** 2 for T_k in T_preds]))
+        jsp_DO = cs.sum1(cs.vertcat(
+            *[((p_DO_ref[0, k] - DO_preds[k]) / TEMPDO_DO_SCALE) ** 2
+              for k in range(self.N)]))
+
+        js_tin = ((Tin[0, 0] - p_u_prev_tin) / tin_range) ** 2
+        js_air = (Airn[0, 0] - p_u_prev_airn) ** 2   # Airn already in [0,1]
+        for i in range(1, self.N):
+            js_tin += ((Tin[0, i] - Tin[0, i-1]) / tin_range) ** 2
+            js_air += (Airn[0, i] - Airn[0, i-1]) ** 2
+
+        opti.minimize(w['T'] * jsp_T + w['DO'] * jsp_DO +
+                      w['s_tin'] * js_tin + w['s_air'] * js_air)
+
+        opti.solver('ipopt', {'ipopt': {
+            'print_level': 0,  # quiet; _fail_count print surfaces problems
+            'max_iter': 200,
+            'tol': 1e-2,
+            'acceptable_tol': 1e-1,
+            'acceptable_iter': 5,
+            'hessian_approximation': 'limited-memory',
+            'mu_strategy': 'adaptive',
+        }})
+
+        self.opti = opti
+        self.Tin = Tin; self.Airn = Airn; self.Air = Air
+        self.p_x0 = p_x0; self.p_dist = p_dist
+        self.p_T_ref = p_T_ref; self.p_DO_ref = p_DO_ref
+        self.p_u_co2 = p_u_co2
+        self.p_u_prev_tin = p_u_prev_tin; self.p_u_prev_airn = p_u_prev_airn
+
+    def solve(self, x_curr, d_matrix, T_ref, DO_ref, u_co2=0.0,
+              u_prev_air=0.0, u_prev_tin=30.0):
+        # DO_ref may be a scalar or a length-N vector (day/night profile).
+        DO_ref = np.atleast_1d(np.asarray(DO_ref, dtype=float)).ravel()
+        if DO_ref.size == 1:
+            DO_ref = np.full(self.N, DO_ref[0])
+        DO_ref = DO_ref[:self.N]
+
+        # Repeated identical calls within one 5-min step (the controller is bound
+        # to both fn_DO_air and fn_Temp_HX) hit this cache instead of re-solving.
+        key = (tuple(np.round(x_curr, 6)), round(float(T_ref), 6),
+               tuple(np.round(DO_ref, 6)), round(float(u_co2), 9),
+               round(float(u_prev_air), 9), round(float(u_prev_tin), 6))
+        if getattr(self, '_cache', {}).get('key') == key:
+            return self._cache['result']
+
+        u_prev_airn = float(u_prev_air) / U_UB[1]
+
+        self.opti.set_value(self.p_x0, x_curr)
+        self.opti.set_value(self.p_dist, d_matrix)
+        self.opti.set_value(self.p_T_ref, T_ref)
+        self.opti.set_value(self.p_DO_ref, DO_ref.reshape(1, self.N))
+        self.opti.set_value(self.p_u_co2, u_co2)
+        self.opti.set_value(self.p_u_prev_tin, u_prev_tin)
+        self.opti.set_value(self.p_u_prev_airn, u_prev_airn)
+
+        if hasattr(self, 'last_sol'):
+            prev_Tin  = self.last_sol.value(self.Tin).reshape(1, self.N)
+            prev_Airn = self.last_sol.value(self.Airn).reshape(1, self.N)
+            self.opti.set_initial(self.Tin,  np.hstack([prev_Tin[:, 1:],  prev_Tin[:, -1:]]))
+            self.opti.set_initial(self.Airn, np.hstack([prev_Airn[:, 1:], prev_Airn[:, -1:]]))
+        else:
+            self.opti.set_initial(self.Tin,  np.full((1, self.N), u_prev_tin))
+            self.opti.set_initial(self.Airn, np.full((1, self.N), u_prev_airn))
+
+        try:
+            sol = self.opti.solve()
+            self.last_sol = sol
+            result = [float(sol.value(self.Air[0, 0])), QHX_CONST,
+                      float(sol.value(self.Tin[0, 0]))]
+        except Exception as e:
+            self._fail_count += 1
+            print(f"[SimpleTempDOMPC] Solver failed ({self._fail_count}): {e}")
+            if hasattr(self, 'last_sol'):
+                result = [float(self.last_sol.value(self.Air[0, 0])), QHX_CONST,
+                          float(self.last_sol.value(self.Tin[0, 0]))]
+            else:
+                result = [u_prev_air, QHX_CONST, float(T_ref)]
+
+        self._cache = {'key': key, 'result': result}
+        return result
+
+
 # --- Singleton Logic ---
 _solver_instance = None
 _temp_solver_instance = None
 _simple_temp_solver_instance = None
 _simple_ph_solver_instance = None
+_simple_tempdo_solver_instance = None
 
 
 def get_mpc_action(x, d_matrix, r, u_prev_ext):
@@ -693,4 +858,16 @@ def get_simple_ph_mpc_action(x, d_matrix, pH_ref, u_prev_co2=0.0,
     return _simple_ph_solver_instance.solve(
         np.array(x).ravel(), np.array(d_matrix), float(pH_ref),
         u_air=u_air, u_qhx=u_qhx, u_tin=u_tin, u_prev_co2=float(u_prev_co2)
+    )
+
+
+def get_simple_tempdo_mpc_action(x, d_matrix, T_ref, DO_ref, u_co2=0.0,
+                                 u_prev_air=0.0, u_prev_tin=30.0):
+    global _simple_tempdo_solver_instance
+    if _simple_tempdo_solver_instance is None:
+        _simple_tempdo_solver_instance = SimpleTempDOMPC()
+    return _simple_tempdo_solver_instance.solve(
+        np.array(x).ravel(), np.array(d_matrix), float(T_ref), DO_ref,
+        u_co2=float(u_co2), u_prev_air=float(u_prev_air),
+        u_prev_tin=float(u_prev_tin)
     )
