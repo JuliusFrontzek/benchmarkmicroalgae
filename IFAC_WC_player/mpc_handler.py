@@ -197,6 +197,8 @@ TEMPDO_W = {
     'DO':    1.0,   # DO setpoint tracking (normalised by DO_SCALE)
     's_tin': 0.5,   # Tin move smoothness
     's_air': 2.0,   # air move smoothness (higher -> less DO actuation noise)
+    'c_air': 0.5,   # air consumption: keep air off its max so it does not
+                    # over-strip CO2 and disturb the pH loop
 }
 
 
@@ -720,8 +722,11 @@ class SimpleTempDOMPC:
             js_tin += ((Tin[0, i] - Tin[0, i-1]) / tin_range) ** 2
             js_air += (Airn[0, i] - Airn[0, i-1]) ** 2
 
+        jc_air = consumption_cost(Air, U_UB[1])      # sum(Air)/air_max = sum(Airn)
+
         opti.minimize(w['T'] * jsp_T + w['DO'] * jsp_DO +
-                      w['s_tin'] * js_tin + w['s_air'] * js_air)
+                      w['s_tin'] * js_tin + w['s_air'] * js_air +
+                      w['c_air'] * jc_air)
 
         opti.solver('ipopt', {'ipopt': {
             'print_level': 0,  # quiet; _fail_count print surfaces problems
