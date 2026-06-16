@@ -8,6 +8,9 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import os
 
+# Single source of truth for the trained NN model file. Swap this to use a new model.
+MODEL_PATH = "dynamic_model_v2_l4casadi.pt"
+
 # Module-level state history buffer (filled by get_mpc_action each call)
 _state_history = []
 _MAX_HISTORY = 60
@@ -16,7 +19,7 @@ _MAX_HISTORY = 60
 _raw_nn_model = None
 
 
-def _load_raw_model(model_path="dynamic_model_l4casadi.pt"):
+def _load_raw_model(model_path=MODEL_PATH):
     global _raw_nn_model
     if _raw_nn_model is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -67,7 +70,7 @@ def _nn_rollout_numpy(nn_model, x0, u_seq, d_matrix):
 
 def plot_nn_predictions(x_history, x_curr, u_fixed, d_matrix,
                         refs=None, save_path="nn_prediction_debug.png",
-                        model_path="dynamic_model_l4casadi.pt"):
+                        model_path=MODEL_PATH):
     """Diagnostic plot: past observed states + NN open-loop future predictions.
 
     Args:
@@ -133,6 +136,13 @@ def plot_nn_predictions(x_history, x_curr, u_fixed, d_matrix,
 def relative_absolute_error(ref, y, eps=1e-12):
     return cs.sum2(cs.fabs(ref - y) / (cs.fabs(ref) + eps))
 
+def smooth_relative_error(ref, y, delta=1.0, eps=1e-12):
+    # Smooth (pseudo-Huber) analogue of relative_absolute_error: the sqrt
+    # removes the abs() kink that makes IPOPT thrash, while keeping the same
+    # ~|e|/|ref| magnitude so the benchmark 'sp' weights stay calibrated.
+    # delta sets the half-width of the quadratic core (raw units); tune if needed.
+    return cs.sum2((cs.sqrt((ref - y)**2 + delta) - cs.sqrt(delta)) / (cs.fabs(ref) + eps))
+
 def smoothness_cost(u, u_prev, u_min, u_max, eps=1e-12):
     u_range = (u_max - u_min) + eps
     cost = ((u[0] - u_prev) / u_range)**2
@@ -189,22 +199,27 @@ SIMPLE_PH_MPC_N = 6
 # weights, all in one place for easy tuning. Optimises Tin_hx (temperature) and
 # air injection (DO) together; Qhx fixed at QHX_CONST, CO2 fixed (param).
 SIMPLE_TEMPDO_MPC_N = 6
-# DO error is divided by DO_SCALE (~one std) before squaring so its tracking
-# term is the same order as the temperature term (raw degC^2).
-TEMPDO_DO_SCALE = 30.0
+# Cost weights mirroring the full MicroalgaeMPC: smooth relative-error tracking
+# ('sp'), actuator move smoothness ('s'/'s1'/'s2') and actuator consumption ('c').
+# For temperature s2 weights the inlet-temperature Tin smoothness. Qhx is pinned at
+# QHX_CONST (to avoid the bilinear Qhx*(Tin-T) degeneracy), so the Qhx-smoothness
+# 's1' and Qhx-consumption 'c' weights are INACTIVE -- kept here for documentation
+# and in case Qhx is ever optimised again.
+#
+# DO air: the benchmark DO cost heavily penalises non-smooth air actuation, so 's'
+# is set high (smooth, near-constant air) and consumption 'c' to ~0. 's' is the
+# main DO tuning knob -- smoothness_cost penalises step-to-step CHANGES (not the
+# level), so a high 's' still lets air follow the slow daily DO trend while
+# killing the bang-bang. Raise it if air still chatters; lower if DO lags by day.
 TEMPDO_W = {
-    'T':     1.0,   # temperature setpoint tracking (raw degC^2)
-    'DO':    1.0,   # DO setpoint tracking (normalised by DO_SCALE)
-    's_tin': 0.5,   # Tin move smoothness
-    's_air': 2.0,   # air move smoothness (higher -> less DO actuation noise)
-    'c_air': 0.5,   # air consumption: keep air off its max so it does not
-                    # over-strip CO2 and disturb the pH loop
+    'DO': {'sp': 34,  's': 30.0, 'c': 0.0},
+    'T':  {'sp': 183, 's1': 3.0, 's2': 8.462, 'c': 0.0001},
 }
 
 
 # --- Full MPC Class ---
 class MicroalgaeMPC:
-    def __init__(self, model_path="dynamic_model_l4casadi.pt"):
+    def __init__(self, model_path=MODEL_PATH):
         self.N = 12
         self.nx = 5
         self.nu = 4
@@ -322,7 +337,7 @@ class TemperatureOnlyMPC:
     CO2 and air are treated as fixed zeros so the NN sees a consistent input.
     Useful for verifying that the NN temperature model is working correctly.
     """
-    def __init__(self, model_path="dynamic_model_l4casadi.pt"):
+    def __init__(self, model_path=MODEL_PATH):
         self.N = 12; self.nx = 5; self.nu = 4; self.nd = 7
         self.opti = cs.Opti()
         self._fail_count = 0
@@ -431,7 +446,7 @@ class SimpleTempMPC:
     fed in by the caller so the controller can pre-heat before cold-water
     injections.
     """
-    def __init__(self, model_path="dynamic_model_l4casadi.pt"):
+    def __init__(self, model_path=MODEL_PATH):
         self.N = SIMPLE_TEMP_MPC_N
         self._fail_count = 0
 
@@ -538,7 +553,7 @@ class SimplePHMPC:
     SimpleTempMPC) rather than the main class's relative_absolute_error: the
     abs() kink at the setpoint crossing makes the smooth IPOPT NLP thrash.
     """
-    def __init__(self, model_path="dynamic_model_l4casadi.pt"):
+    def __init__(self, model_path=MODEL_PATH):
         self.N = SIMPLE_PH_MPC_N
         self._fail_count = 0
 
@@ -651,16 +666,18 @@ class SimpleTempDOMPC:
     N-step MPC that controls BOTH raceway temperature and dissolved oxygen.
     Decision variables: inlet temperature Tin (U[3]) and air injection (U[1]);
     horizon N = SIMPLE_TEMPDO_MPC_N (5 min/step). The heat-exchanger flux Qhx is
-    held at QHX_CONST (as in SimpleTempMPC) and CO2 (U[0]) is a fixed parameter
-    taken from the co-running pH controller.
+    held at QHX_CONST (as in SimpleTempMPC, to avoid the bilinear Qhx*(Tin-T)
+    degeneracy) and CO2 (U[0]) is a fixed parameter from the co-running pH ctrl.
 
-    Cost: smooth quadratic tracking of the temperature setpoint (scalar) and the
-    dissolved-oxygen setpoint (per-step vector, so a day/night DO profile can be
-    tracked within the horizon) plus Tin and air move-smoothness. Air smoothness
-    is weighted relatively high to keep the DO actuation quiet (less noisy than
-    the PI baseline). The temperature half mirrors SimpleTempMPC exactly.
+    Cost: the benchmark-mirroring formulation of the full MicroalgaeMPC, with its
+    DO and T weights (TEMPDO_W) -- setpoint tracking + actuator move smoothness +
+    actuator consumption. Tracking uses smooth_relative_error (a pseudo-Huber
+    analogue of the main class's relative_absolute_error): the smooth surrogate
+    keeps the same magnitude so the copied 'sp' weights stay calibrated, while
+    removing the abs() kink that makes the smooth IPOPT NLP thrash. The DO
+    setpoint is a per-step vector so a day/night profile can be tracked.
     """
-    def __init__(self, model_path="dynamic_model_l4casadi.pt"):
+    def __init__(self, model_path=MODEL_PATH):
         self.N = SIMPLE_TEMPDO_MPC_N
         self._fail_count = 0
 
@@ -669,10 +686,10 @@ class SimpleTempDOMPC:
 
         opti = cs.Opti()
 
-        # Decision variables: Tin trajectory + normalised air trajectory. Air is
-        # optimised in [0, 1] and mapped to physical units via U_UB[1] (U_LB[1]=0)
-        # because physical air is O(1e-3) and badly scaled for IPOPT (same trick
-        # as SimplePHMPC's CO2).
+        # Decision variables: Tin (temperature) and normalised air (DO). Qhx is
+        # held at QHX_CONST. Air is optimised in [0, 1] and mapped to physical
+        # units via U_UB[1] because physical air is O(1e-3) and badly scaled for
+        # IPOPT (same trick as SimplePHMPC's CO2).
         Tin  = opti.variable(1, self.N)
         Airn = opti.variable(1, self.N)
         Air  = Airn * U_UB[1]
@@ -685,12 +702,18 @@ class SimpleTempDOMPC:
         p_u_co2       = opti.parameter()           # fixed CO2 from pH controller
         p_u_prev_tin  = opti.parameter()
         p_u_prev_airn = opti.parameter()           # previous air, normalised
+        p_air_gate    = opti.parameter(1, self.N)  # 1 = day (air allowed), 0 = night
 
-        # Box constraints
+        # Box constraints (physical actuator limits)
         opti.subject_to(Tin >= U_LB[3])
         opti.subject_to(Tin <= U_UB[3])
         opti.subject_to(Airn >= 0.0)
         opti.subject_to(Airn <= 1.0)
+        # Night gate: air can only pull DO toward ~100% sat, so injecting at night
+        # is wasted actuation. gate=0 forces Airn<=0 (=> 0) on night steps; gate=1
+        # leaves Airn free in [0, 1]. Applied inside the rollout so the DO
+        # prediction stays consistent across dusk/dawn.
+        opti.subject_to(Airn <= p_air_gate)
 
         # Single-shooting: compose N NN calls symbolically (Qhx held constant,
         # CO2 fixed parameter). Collect T and DO predictions for the cost.
@@ -707,30 +730,30 @@ class SimpleTempDOMPC:
             DO_preds.append(x_k[1])
             T_preds.append(x_k[4])
 
-        # Cost: temperature + DO tracking + Tin/air move smoothness
+        # Cost: full-MicroalgaeMPC formulation with its DO and T weights, but
+        # smooth tracking (smooth_relative_error) so IPOPT converges. Qhx is
+        # pinned, so its smoothness ('s1') and consumption ('c') terms are
+        # constant and dropped.
         w = TEMPDO_W
-        tin_range = U_UB[3] - U_LB[3]
+        DO_row = cs.horzcat(*DO_preds)               # 1xN, like X[1, 1:]
+        T_row  = cs.horzcat(*T_preds)                # 1xN, like X[4, 1:]
 
-        jsp_T  = cs.sum1(cs.vertcat(*[(p_T_ref - T_k) ** 2 for T_k in T_preds]))
-        jsp_DO = cs.sum1(cs.vertcat(
-            *[((p_DO_ref[0, k] - DO_preds[k]) / TEMPDO_DO_SCALE) ** 2
-              for k in range(self.N)]))
+        jsp_DO = smooth_relative_error(p_DO_ref, DO_row)
+        jsp_T  = smooth_relative_error(p_T_ref,  T_row)
 
-        js_tin = ((Tin[0, 0] - p_u_prev_tin) / tin_range) ** 2
-        js_air = (Airn[0, 0] - p_u_prev_airn) ** 2   # Airn already in [0,1]
-        for i in range(1, self.N):
-            js_tin += ((Tin[0, i] - Tin[0, i-1]) / tin_range) ** 2
-            js_air += (Airn[0, i] - Airn[0, i-1]) ** 2
+        js_DO    = smoothness_cost(Air, p_u_prev_airn * U_UB[1], U_LB[1], U_UB[1])
+        js_tin_T = smoothness_cost(Tin, p_u_prev_tin, U_LB[3], U_UB[3])
 
-        jc_air = consumption_cost(Air, U_UB[1])      # sum(Air)/air_max = sum(Airn)
+        jc_DO = consumption_cost(Air, U_UB[1])
 
-        opti.minimize(w['T'] * jsp_T + w['DO'] * jsp_DO +
-                      w['s_tin'] * js_tin + w['s_air'] * js_air +
-                      w['c_air'] * jc_air)
+        opti.minimize(
+            w['DO']['sp']*jsp_DO + w['DO']['s']*js_DO + w['DO']['c']*jc_DO +
+            w['T']['sp']*jsp_T + w['T']['s2']*js_tin_T
+        )
 
         opti.solver('ipopt', {'ipopt': {
             'print_level': 0,  # quiet; _fail_count print surfaces problems
-            'max_iter': 200,
+            'max_iter': 300,
             'tol': 1e-2,
             'acceptable_tol': 1e-1,
             'acceptable_iter': 5,
@@ -744,20 +767,34 @@ class SimpleTempDOMPC:
         self.p_T_ref = p_T_ref; self.p_DO_ref = p_DO_ref
         self.p_u_co2 = p_u_co2
         self.p_u_prev_tin = p_u_prev_tin; self.p_u_prev_airn = p_u_prev_airn
+        self.p_air_gate = p_air_gate
 
     def solve(self, x_curr, d_matrix, T_ref, DO_ref, u_co2=0.0,
-              u_prev_air=0.0, u_prev_tin=30.0):
-        # DO_ref may be a scalar or a length-N vector (day/night profile).
+              u_prev_air=0.0, u_prev_qhx=0.0, u_prev_tin=30.0, air_gate=None):
+        # u_prev_qhx is accepted for call-signature compatibility but unused:
+        # the flux is fixed at QHX_CONST and only Tin/Air are optimised.
+        # DO_ref may be a scalar or a length-N vector (tracks the benchmark refs.DO).
         DO_ref = np.atleast_1d(np.asarray(DO_ref, dtype=float)).ravel()
         if DO_ref.size == 1:
             DO_ref = np.full(self.N, DO_ref[0])
         DO_ref = DO_ref[:self.N]
 
+        # Per-step night gate (1 day / 0 night). Default: all day (air always
+        # allowed) so callers that omit it keep the old behaviour.
+        if air_gate is None:
+            air_gate = np.ones(self.N)
+        else:
+            air_gate = np.atleast_1d(np.asarray(air_gate, dtype=float)).ravel()
+            if air_gate.size == 1:
+                air_gate = np.full(self.N, air_gate[0])
+            air_gate = air_gate[:self.N]
+
         # Repeated identical calls within one 5-min step (the controller is bound
         # to both fn_DO_air and fn_Temp_HX) hit this cache instead of re-solving.
         key = (tuple(np.round(x_curr, 6)), round(float(T_ref), 6),
                tuple(np.round(DO_ref, 6)), round(float(u_co2), 9),
-               round(float(u_prev_air), 9), round(float(u_prev_tin), 6))
+               round(float(u_prev_air), 9), round(float(u_prev_qhx), 9),
+               round(float(u_prev_tin), 6), tuple(np.round(air_gate, 6)))
         if getattr(self, '_cache', {}).get('key') == key:
             return self._cache['result']
 
@@ -770,6 +807,7 @@ class SimpleTempDOMPC:
         self.opti.set_value(self.p_u_co2, u_co2)
         self.opti.set_value(self.p_u_prev_tin, u_prev_tin)
         self.opti.set_value(self.p_u_prev_airn, u_prev_airn)
+        self.opti.set_value(self.p_air_gate, air_gate.reshape(1, self.N))
 
         if hasattr(self, 'last_sol'):
             prev_Tin  = self.last_sol.value(self.Tin).reshape(1, self.N)
@@ -819,7 +857,7 @@ def get_mpc_action(x, d_matrix, r, u_prev_ext):
 
 def get_prediction_plot(x_curr, u_fixed, d_matrix, refs=None,
                         save_path="nn_prediction_debug.png",
-                        model_path="dynamic_model_l4casadi.pt"):
+                        model_path=MODEL_PATH):
     """MATLAB-callable wrapper: plot NN predictions using the stored history buffer.
 
     Call from MATLAB via:
@@ -867,12 +905,14 @@ def get_simple_ph_mpc_action(x, d_matrix, pH_ref, u_prev_co2=0.0,
 
 
 def get_simple_tempdo_mpc_action(x, d_matrix, T_ref, DO_ref, u_co2=0.0,
-                                 u_prev_air=0.0, u_prev_tin=30.0):
+                                 u_prev_air=0.0, u_prev_qhx=0.0, u_prev_tin=30.0,
+                                 air_gate=None):
     global _simple_tempdo_solver_instance
     if _simple_tempdo_solver_instance is None:
         _simple_tempdo_solver_instance = SimpleTempDOMPC()
     return _simple_tempdo_solver_instance.solve(
         np.array(x).ravel(), np.array(d_matrix), float(T_ref), DO_ref,
         u_co2=float(u_co2), u_prev_air=float(u_prev_air),
-        u_prev_tin=float(u_prev_tin)
+        u_prev_qhx=float(u_prev_qhx), u_prev_tin=float(u_prev_tin),
+        air_gate=air_gate
     )

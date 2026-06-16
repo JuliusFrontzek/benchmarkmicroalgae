@@ -16,10 +16,10 @@ function [st_CtrlSignals, state] = controller_simple_temp_do_mpc(Timeline, obs, 
 % and the benchmark extracts Qair from the DO handle and Qhx/Tin_hx from the
 % temperature handle.
 
-    % --- Day/night DO setpoints [% sat] and the day/night radiation threshold ---
-    DO_DAY        = 150;
-    DO_NIGHT      = 90;
-    RAD_THRESHOLD = 20;     % [W/m^2] forecast RadGlobal above this => "day"
+    % Radiation threshold separating day from night. Air injection only pulls DO
+    % toward ~100 %% saturation, so injecting at night is wasted -- below this the
+    % air is gated off inside the MPC (matches the baseline DO PI's rad_threshold).
+    RAD_THRESHOLD = 10;     % [W/m^2] forecast RadGlobal above this => "day"
 
     if isempty(state) || ~isfield(state, 'last_solve_time')
         state.next_run_time   = -1;
@@ -60,9 +60,17 @@ function [st_CtrlSignals, state] = controller_simple_temp_do_mpc(Timeline, obs, 
     else
         T_setpoint = 27.0;
     end
+    % Track the benchmark's own DO reference (what the benchmark scores against);
+    % fall back to 150 %% sat if it is not supplied.
+    if isfield(refs, 'DO') && ~isempty(refs.DO)
+        DO_setpoint = double(refs.DO);
+    else
+        DO_setpoint = 150.0;
+    end
     if ~state.sp_announced
-        fprintf(['[SimpleTempDOMPC] Tracking T = %.2f degC; DO = %d (day) / ' ...
-                 '%d (night) %% sat\n'], T_setpoint, DO_DAY, DO_NIGHT);
+        fprintf(['[SimpleTempDOMPC] Tracking benchmark refs: T = %.2f degC; ' ...
+                 'DO = %.0f %% sat; air gated off below %d W/m^2\n'], ...
+                 T_setpoint, DO_setpoint, RAD_THRESHOLD);
         state.sp_announced = true;
     end
 
@@ -122,11 +130,13 @@ function [st_CtrlSignals, state] = controller_simple_temp_do_mpc(Timeline, obs, 
         d_matrix = [RadGlobal_q; RadPAR_q; Temp_ext_q; RH_q; Wind_q; ...
                     Qd_future; Qh_future];
 
-        % Day/night DO setpoint per step from the forecast radiation. Radiation
-        % crosses the threshold once at dawn and once at dusk, so the setpoint
-        % switches only twice per day.
-        DO_ref = DO_NIGHT * ones(1, N_horiz);
-        DO_ref(RadGlobal_q > RAD_THRESHOLD) = DO_DAY;
+        % Track the benchmark's own DO reference, held flat over the horizon
+        % (future.* carries no DO forecast). This is what the benchmark scores.
+        DO_ref = DO_setpoint * ones(1, N_horiz);
+
+        % Night air gate: 1 where the forecast says "day" (air allowed), 0 at
+        % night so the MPC forces zero air injection (wasted otherwise).
+        air_gate = double(RadGlobal_q > RAD_THRESHOLD);
 
         % CO2 actually applied by the co-running pH controller (threaded through
         % st_CtrlSignals). Missing -> NaN -> Python falls back to 0.
@@ -139,9 +149,10 @@ function [st_CtrlSignals, state] = controller_simple_temp_do_mpc(Timeline, obs, 
         try
             u_python = pyrun( ...
                 "from mpc_handler import get_simple_tempdo_mpc_action; " + ...
-                "res = get_simple_tempdo_mpc_action(x, d, T_ref, DO_ref, u_co2, u_prev_air, u_prev_tin)", ...
+                "res = get_simple_tempdo_mpc_action(x, d, T_ref, DO_ref, u_co2, u_prev_air, u_prev_qhx, u_prev_tin, air_gate)", ...
                 "res", x=x_curr, d=d_matrix, T_ref=T_setpoint, DO_ref=DO_ref, ...
-                u_co2=u_co2, u_prev_air=state.last_air, u_prev_tin=state.last_tin);
+                u_co2=u_co2, u_prev_air=state.last_air, u_prev_qhx=state.last_qhx, ...
+                u_prev_tin=state.last_tin, air_gate=air_gate);
 
             result = double(u_python);
             state.last_air = result(1);
@@ -151,6 +162,12 @@ function [st_CtrlSignals, state] = controller_simple_temp_do_mpc(Timeline, obs, 
             state.last_solve_time = currentTime;
         catch ME
             fprintf('[SimpleTempDOMPC] Python error: %s\n', ME.message);
+        end
+
+        % Belt-and-suspenders: guarantee exactly zero applied air at night,
+        % regardless of any small solver residual (the MPC already gates it).
+        if air_gate(1) <= 0
+            state.last_air = 0;
         end
     end
 
